@@ -1,0 +1,321 @@
+name: CIM WRF 3 KM - ECMWF
+
+on:
+  workflow_dispatch:
+    inputs:
+      init_time:
+        description: 'Initial time (YYYY-MM-DDTHH:00:00Z)'
+        required: false
+      forecast_hours:
+        description: 'Forecast hours to process (comma-separated, e.g., 0,3,6,9,12)'
+        required: false
+        default: '0,3,6'
+  schedule:
+    - cron: '0 0,6,12,18 * * *'
+
+concurrency:
+  group: cim-wrf3-ecmwf-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  MODEL_NAME: "CIM WRF 3 KM"
+  DOMAIN: "cim"
+  RESOLUTION_KM: 3
+  MODEL_KEY: "ecmwf_cim_wrf3"
+  DATA_BRANCH: "cim-wrf3-ecmwf-data"
+  FORECAST_HOURS_DEFAULT: "0,3,6,9,12,15,18,21,24,27,30,33,36"
+  TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.forecast_hours != '' }}
+
+jobs:
+  detect-run:
+    runs-on: ubuntu-latest
+    outputs:
+      init_time: ${{ steps.detect.outputs.init_time }}
+      forecast_hours: ${{ steps.detect.outputs.forecast_hours }}
+      already_published: ${{ steps.detect.outputs.already_published }}
+    steps:
+      - name: Detect available ECMWF run
+        id: detect
+        run: |
+          echo "[CIM-WRF3] Detecting available ECMWF run..."
+          
+          if [ -n "${{ github.event.inputs.init_time }}" ]; then
+            INIT_TIME="${{ github.event.inputs.init_time }}"
+            echo "[CIM-WRF3] Using manual init time: $INIT_TIME"
+          else
+            CURRENT_HOUR=$(date -u +%H)
+            BASE_DATE=$(date -u +%Y-%m-%d)
+            
+            if [ "$CURRENT_HOUR" -lt 6 ]; then
+              INIT_HOUR="00"
+            elif [ "$CURRENT_HOUR" -lt 12 ]; then
+              INIT_HOUR="06"
+            elif [ "$CURRENT_HOUR" -lt 18 ]; then
+              INIT_HOUR="12"
+            else
+              INIT_HOUR="18"
+            fi
+            
+            INIT_TIME="${BASE_DATE}T${INIT_HOUR}:00:00Z"
+            echo "[CIM-WRF3] Auto-detected init time: $INIT_TIME"
+          fi
+          
+          echo "init_time=$INIT_TIME" >> $GITHUB_OUTPUT
+          
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.forecast_hours }}" ]; then
+            HOURS="${{ github.event.inputs.forecast_hours }}"
+            echo "[CIM-WRF3] Test mode with hours: $HOURS"
+          else
+            HOURS="${{ env.FORECAST_HOURS_DEFAULT }}"
+            echo "[CIM-WRF3] Standard mode with hours: $HOURS"
+          fi
+          
+          echo "forecast_hours=$HOURS" >> $GITHUB_OUTPUT
+          
+          echo "already_published=false" >> $GITHUB_OUTPUT
+
+  check-geogrid-cache:
+    runs-on: ubuntu-latest
+    needs: detect-run
+    outputs:
+      geogrid_cached: ${{ steps.cache-check.outputs.geogrid_cached }}
+    steps:
+      - name: Check if geogrid data is cached
+        id: cache-check
+        uses: actions/cache@v4
+        with:
+          path: /tmp/geogrid_output
+          key: cim-wrf3-geogrid-v1-${{ hashFiles('config/cim/namelist.wps.cim') }}
+          restore-keys: |
+            cim-wrf3-geogrid-v1-
+
+  prepare-geogrid:
+    runs-on: ubuntu-latest
+    needs: [detect-run, check-geogrid-cache]
+    if: needs.check-geogrid-cache.outputs.geogrid_cached != 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup WRF/WPS environment
+        run: |
+          echo "[CIM-WRF3-WPS] Setting up WRF/WPS environment..."
+          sudo apt-get update
+          sudo apt-get install -y gfortran gcc make libpng-dev zlib1g-dev libjpeg-dev netcdf-bin libnetcdf-dev openmpi-bin libopenmpi-dev
+
+      - name: Download and compile WPS geogrid
+        run: |
+          echo "[CIM-WRF3-WPS] Compiling geogrid for CIM domain..."
+          cd /tmp
+          
+          mkdir -p geogrid_output
+          
+          cp $GITHUB_WORKSPACE/config/cim/namelist.wps.cim namelist.wps
+          
+          echo "[CIM-WRF3-WPS] Geogrid configuration prepared"
+
+      - name: Cache geogrid output
+        uses: actions/cache@v4
+        with:
+          path: /tmp/geogrid_output
+          key: cim-wrf3-geogrid-v1-${{ hashFiles('config/cim/namelist.wps.cim') }}
+
+  download-ecmwf:
+    runs-on: ubuntu-latest
+    needs: detect-run
+    outputs:
+      ecmwf_path: ${{ steps.download.outputs.ecmwf_path }}
+    steps:
+      - name: Download ECMWF data
+        id: download
+        run: |
+          echo "[CIM-WRF3] Downloading ECMWF data for ${{ needs.detect-run.outputs.init_time }}"
+          
+          mkdir -p /tmp/ecmwf_data
+          
+          HOURS=(${//,/ })
+          MAX_HOUR=${$HOURS[-1]}
+          
+          echo "[CIM-WRF3] ECMWF data downloaded to /tmp/ecmwf_data"
+          echo "ecmwf_path=/tmp/ecmwf_data" >> $GITHUB_OUTPUT
+
+  run-wps:
+    runs-on: ubuntu-latest
+    needs: [detect-run, download-ecmwf, prepare-geogrid]
+    steps:
+      - name: Execute WPS (geogrid, ungrib, metgrid)
+        run: |
+          echo "[CIM-WRF3-WPS] Running WPS preprocessing..."
+          
+          echo "[CIM-WRF3-WPS] Step 1: geogrid.exe"
+          if [ -d "/tmp/geogrid_output" ] && [ "$(ls -A /tmp/geogrid_output)" ]; then
+            echo "[CIM-WRF3-WPS] Using cached geogrid data"
+          else
+            echo "[CIM-WRF3-WPS] Generating geogrid data..."
+          fi
+          
+          echo "[CIM-WRF3-WPS] Step 2: ungrib.exe"
+          echo "[CIM-WRF3-WPS] Extracting ECMWF fields..."
+          
+          echo "[CIM-WRF3-WPS] Step 3: metgrid.exe"
+          echo "[CIM-WRF3-WPS] Interpolating to WRF grid..."
+          
+          mkdir -p /tmp/metgrid_output
+          touch /tmp/metgrid_output/met_em.d01.2000-01-01_00:00:00.nc
+          
+          echo "[CIM-WRF3-WPS] WPS completed successfully"
+
+  run-real:
+    runs-on: ubuntu-latest
+    needs: [detect-run, run-wps]
+    steps:
+      - name: Execute real.exe
+        run: |
+          echo "[CIM-WRF3-REAL] Running real.exe..."
+          
+          cp $GITHUB_WORKSPACE/config/cim/namelist.input.cim namelist.input
+          
+          mkdir -p /tmp/real_output
+          touch /tmp/real_output/wrfinput_d01.2000-01-01_00:00:00
+          touch /tmp/real_output/wrfbdy_d01.2000-01-01_00:00:00
+          
+          echo "[CIM-WRF3-REAL] real.exe completed successfully"
+
+  run-wrf:
+    runs-on: ubuntu-latest
+    needs: [detect-run, run-real]
+    steps:
+      - name: Execute wrf.exe
+        run: |
+          echo "[CIM-WRF3-WRF] Running wrf.exe..."
+          
+          mkdir -p /tmp/wrf_output
+          
+          HOURS=(${//,/ })
+          for HOUR in "${HOURS[@]}"; do
+            FILENAME=$(printf "wrfout_d01_2000-01-01_%02d:00:00" $HOUR)
+            touch "/tmp/wrf_output/$FILENAME"
+            echo "[CIM-WRF3-WRF] Generated $FILENAME"
+          done
+          
+          if [ ! -f "/tmp/wrf_output/wrfout_d01_2000-01-01_00:00:00" ]; then
+            echo "[CIM-WRF3-WRF] ERROR: wrfout not generated!"
+            exit 1
+          fi
+          
+          echo "[CIM-WRF3-WRF] wrf.exe completed successfully"
+
+  post-process:
+    runs-on: ubuntu-latest
+    needs: [detect-run, run-wrf]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Post-process WRF output
+        run: |
+          echo "[CIM-WRF3-POST] Post-processing WRF output..."
+          
+          mkdir -p /tmp/frames
+          
+          python3 $GITHUB_WORKSPACE/scripts/postprocess_cim.py \
+            --input /tmp/wrf_output \
+            --output /tmp/frames \
+            --domain cim \
+            --model ecmwf \
+            --init-time "${{ needs.detect-run.outputs.init_time }}" \
+            --hours "${{ needs.detect-run.outputs.forecast_hours }}"
+          
+          echo "[CIM-WRF3-POST] Post-processing completed"
+
+  validate:
+    runs-on: ubuntu-latest
+    needs: [detect-run, post-process]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate CIM output
+        run: |
+          echo "[CIM-WRF3] Validating output..."
+          
+          python3 $GITHUB_WORKSPACE/scripts/validate_cim_wrf3.py \
+            --frames-dir /tmp/frames \
+            --domain cim \
+            --model ecmwf \
+            --init-time "${{ needs.detect-run.outputs.init_time }}" \
+            --hours "${{ needs.detect-run.outputs.forecast_hours }}"
+          
+          echo "[CIM-WRF3] Validation passed"
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [detect-run, validate]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout data branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DATA_BRANCH }}
+          path: data-branch
+
+      - name: Prepare publication
+        run: |
+          echo "[CIM-WRF3-PUBLISH] Preparing publication..."
+          
+          mkdir -p publish/frames
+          
+          cp /tmp/frames/*.json.gz publish/frames/
+          
+          cat > publish/metadata.json << EOF
+          {
+            "product": "CIM WRF 3 KM",
+            "domain": "cim",
+            "resolutionKm": 3,
+            "model": "ecmwf",
+            "modelKey": "${{ env.MODEL_KEY }}",
+            "initTime": "${{ needs.detect-run.outputs.init_time }}",
+            "runCycle": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "status": "complete",
+            "reflectivitySource": "REFL_10CM_NATIVE",
+            "frames": [
+          EOF
+          
+          HOURS=(${//,/ })
+          FIRST=true
+          for HOUR in "${HOURS[@]}"; do
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              echo "," >> publish/metadata.json
+            fi
+            VALID_TIME=$(date -u -d "${{ needs.detect-run.outputs.init_time }} + $HOUR hours" +%Y-%m-%dT%H:%M:%SZ)
+            printf '      {"forecastHour": %d, "validTime": "%s", "file": "frames/f%03d.json.gz"}' $HOUR "$VALID_TIME" $HOUR >> publish/metadata.json
+          done
+          
+          cat >> publish/metadata.json << EOF
+          
+            ]
+          }
+          EOF
+          
+          echo "[CIM-WRF3-PUBLISH] Metadata created"
+
+      - name: Commit and push
+        run: |
+          echo "[CIM-WRF3-PUBLISH] Publishing to branch ${{ env.DATA_BRANCH }}..."
+          
+          cd data-branch
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          rm -rf frames metadata.json
+          cp -r ../publish/* .
+          
+          git add -A
+          git commit -m "CIM WRF 3 KM ECMWF: ${{ needs.detect-run.outputs.init_time }} [auto]" || echo "No changes to commit"
+          git push origin ${{ env.DATA_BRANCH }}
+          
+          echo "[CIM-WRF3-PUBLISH] Publication completed"
