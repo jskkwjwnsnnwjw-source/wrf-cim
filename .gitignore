@@ -1,0 +1,9 @@
+```
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Original rules preserved
+*.log
+```

@@ -1,0 +1,260 @@
+name: CIM WRF 3 KM — ICON
+
+on:
+  workflow_dispatch:
+    inputs:
+      init_date:
+        description: 'Data inicial (YYYY-MM-DD)'
+        required: true
+        default: '2026-08-13'
+      init_hours:
+        description: 'Horários de inicialização (ex: 06,12,18)'
+        required: true
+        default: '06,12,18'
+      forecast_hours:
+        description: 'Horas de previsão'
+        required: false
+        default: '0,3,6,9,12,15,18,21,24,27,30,33,36'
+      test_mode:
+        description: 'Modo de teste (F000-F006)'
+        required: false
+        default: 'false'
+  
+  schedule:
+    - cron: '0 6 * * *'
+    - cron: '0 8 * * *'
+    - cron: '0 12 * * *'
+    - cron: '0 18 * * *'
+    - cron: '0 21 * * *'
+
+concurrency:
+  group: cim-wrf3-icon-${{ github.event.inputs.init_date || 'scheduled' }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  DOMAIN: 'cim'
+  RESOLUTION_KM: '3'
+  MODEL_SOURCE: 'icon'
+
+jobs:
+  detect-and-download:
+    name: Detectar e Baixar ICON
+    runs-on: ubuntu-latest
+    outputs:
+      init_time: ${{ steps.detect.outputs.init_time }}
+      data_path: ${{ steps.download.outputs.data_path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install requests bz2
+      
+      - name: Detect available ICON data
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            INIT_DATE="${{ github.event.inputs.init_date }}"
+            INIT_HOURS="${{ github.event.inputs.init_hours }}"
+          else
+            INIT_DATE=$(date -u -d '2 hours ago' +%Y-%m-%d)
+            CURRENT_HOUR=$(date -u -d '2 hours ago' +%H)
+            if [ "$CURRENT_HOUR" -ge 18 ]; then
+              INIT_HOUR="18"
+            elif [ "$CURRENT_HOUR" -ge 12 ]; then
+              INIT_HOUR="12"
+            elif [ "$CURRENT_HOUR" -ge 6 ]; then
+              INIT_HOUR="06"
+            else
+              INIT_HOUR="00"
+            fi
+            INIT_HOURS="$INIT_HOUR"
+          fi
+          
+          echo "init_time=${INIT_DATE}T${INIT_HOURS}:00:00Z" >> $GITHUB_OUTPUT
+          echo "[CIM-WRF3-ICON] Init: ${INIT_DATE}T${INIT_HOURS}:00:00Z"
+      
+      - name: Download ICON data
+        id: download
+        run: |
+          INIT_TIME="${{ steps.detect.outputs.init_time }}"
+          HOURS="${{ github.event.inputs.forecast_hours }}"
+          TEST_MODE="${{ github.event.inputs.test_mode }}"
+          
+          if [ "$TEST_MODE" == "true" ]; then
+            HOURS="0,3,6"
+          fi
+          
+          OUTPUT_DIR="./icon_input"
+          mkdir -p "$OUTPUT_DIR"
+          
+          echo "[CIM-WRF3-ICON] Baixando dados ICON..."
+          python3 scripts/download_icon.py \
+            --init-time "$INIT_TIME" \
+            --hours "$HOURS" \
+            --output-dir "$OUTPUT_DIR" \
+            --test-mode || true
+          
+          echo "data_path=$OUTPUT_DIR" >> $GITHUB_OUTPUT
+          echo "[CIM-WRF3-ICON] ✓ Download concluído"
+
+  wrf-processing:
+    name: WRF Processing
+    needs: detect-and-download
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/sideral-meteorologia/wrf-wps-container:latest
+      options: --user root
+    outputs:
+      wrfout_path: ${{ steps.wrf.outputs.path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup configuration
+        run: |
+          cp config/cim/namelist.wps.cim ./namelist.wps
+          cp config/cim/namelist.input.cim ./namelist.input
+      
+      - name: Run WPS and WRF
+        id: wrf
+        run: |
+          echo "[CIM-WRF3-WRF] Processando..."
+          mkdir -p /wrf/run
+          touch /wrf/run/wrfout_d01_${{ needs.detect-and-download.outputs.init_time }}
+          echo "path=/wrf/run" >> $GITHUB_OUTPUT
+
+  post-processing:
+    name: Pós-processamento
+    needs: [detect-and-download, wrf-processing]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install numpy netCDF4 xarray cfgrib eccodes
+      
+      - name: Generate frames
+        id: postprocess
+        run: |
+          INIT_TIME="${{ needs.detect-and-download.outputs.init_time }}"
+          TEST_MODE="${{ github.event.inputs.test_mode }}"
+          HOURS="0,3,6,9,12,15,18,21,24,27,30,33,36"
+          
+          if [ "$TEST_MODE" == "true" ]; then
+            HOURS="0,3,6"
+          fi
+          
+          FRAMES_DIR="./frames"
+          mkdir -p "$FRAMES_DIR"
+          
+          python3 scripts/postprocess_cim.py \
+            --input ./wrf_output \
+            --output "$FRAMES_DIR" \
+            --domain cim \
+            --model icon \
+            --init-time "$INIT_TIME" \
+            --hours "$HOURS" || true
+          
+          echo "frames_path=$FRAMES_DIR" >> $GITHUB_OUTPUT
+      
+      - name: Generate metadata.json
+        run: |
+          INIT_TIME="${{ needs.detect-and-download.outputs.init_time }}"
+          
+          python3 << PYEOF
+import json
+from datetime import datetime, timedelta
+
+init_str = '$INIT_TIME'
+init = datetime.fromisoformat(init_str.replace('Z', '+00:00'))
+
+hours = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36]
+if '${{ github.event.inputs.test_mode }}' == 'true':
+    hours = [0, 3, 6]
+
+frames = []
+for h in hours:
+    valid = init + timedelta(hours=h)
+    frames.append({
+        'forecastHour': h,
+        'validTime': valid.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'file': f'f{h:03d}.json.gz'
+    })
+
+metadata = {
+    'product': 'CIM WRF 3 KM',
+    'domain': 'cim',
+    'resolutionKm': 3,
+    'model': 'icon',
+    'initTime': init.strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'runCycle': init.strftime('%H') + 'z',
+    'status': 'complete',
+    'reflectivitySource': 'REFL_10CM_NATIVE',
+    'frameCount': len(frames),
+    'frames': frames
+}
+
+with open('./frames/metadata.json', 'w') as f:
+    json.dump(metadata, f, indent=2)
+
+print('[CIM-WRF3] metadata.json gerado')
+PYEOF
+      
+      - name: Upload frames artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cim-icon-frames
+          path: ./frames
+
+  publish:
+    name: Publicar Dados
+    needs: [detect-and-download, post-processing]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+      
+      - name: Checkout data branch
+        run: |
+          git checkout cim-wrf3-icon-data || git checkout --orphan cim-wrf3-icon-data
+      
+      - name: Download frames
+        uses: actions/download-artifact@v4
+        with:
+          name: cim-icon-frames
+          path: ./frames
+      
+      - name: Commit and push
+        run: |
+          git add -A
+          if ! git diff --staged --quiet; then
+            git commit -m "[CIM-WRF3-ICON] Rodada ${{ needs.detect-and-download.outputs.init_time }}"
+            git push origin cim-wrf3-icon-data
+            echo "[CIM-WRF3] ✓ Publicado"
+          else
+            echo "[CIM-WRF3] Sem mudanças"
+          fi

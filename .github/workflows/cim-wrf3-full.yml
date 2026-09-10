@@ -1,0 +1,271 @@
+name: CIM WRF 3 KM - Full Cycle (ECMWF & ICON)
+
+on:
+  schedule:
+    # Roda todos os dias às 06, 08, 12, 18, 21 UTC
+    # Damos uma margem de 45 min para os dados globais ficarem disponíveis
+    - cron: '45 06,08,12,18,21 * * *'
+  workflow_dispatch:
+    inputs:
+      model_source:
+        description: 'Modelo Forçante (ECMWF ou ICON)'
+        required: true
+        default: 'ecmwf'
+        type: choice
+        options:
+          - ecmwf
+          - icon
+          - both
+      init_time_override:
+        description: 'Horário inicial (YYYY-MM-DDTHH:MM:SSZ). Deixe vazio para automático.'
+        required: false
+        type: string
+
+env:
+  CIM_DOMAIN: "cim"
+  RESOLUTION_KM: 3
+  FORECAST_HOURS: "0,3,6,9,12,15,18,21,24,27,30,33,36"
+  # Imagem Docker com WRF/WPS pré-compilado (Ubuntu + WRF 4.x)
+  # Usaremos uma imagem base genérica e compilaremos o WPS rapidamente se necessário, 
+  # ou usaremos uma específica se disponível. Para este exemplo, simularemos o ambiente ideal.
+  WRF_CONTAINER: "ghcr.io/sideral-meteorologia/wrf-cim-container:latest" 
+
+jobs:
+  detect-cycle:
+    runs-on: ubuntu-latest
+    outputs:
+      init_time: ${{ steps.set-time.outputs.init_time }}
+      run_ecmwf: ${{ steps.check-model.outputs.run_ecmwf }}
+      run_icon: ${{ steps.check-model.outputs.run_icon }}
+    steps:
+      - name: Definir horário da rodada
+        id: set-time
+        run: |
+          if [ -n "${{ github.event.inputs.init_time_override }}" ]; then
+            echo "init_time=${{ github.event.inputs.init_time_override }}" >> $GITHUB_OUTPUT
+          else
+            # Calcula a rodada mais recente disponível (atraso de segurança de 4 horas)
+            CURRENT_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            # Lógica simplificada: pega a hora cheia anterior disponível
+            # Em produção, isso deve alinhar com 00, 06, 12, 18
+            LAST_INIT=$(date -u -d "4 hours ago" +"%Y-%m-%dT00:00:00Z") # Simplificação
+            # Ajuste fino para 00, 06, 12, 18, 21
+            HOUR=$(date -u -d "4 hours ago" +%H)
+            if [ $HOUR -ge 21 ]; then TARGET=21; elif [ $HOUR -ge 18 ]; then TARGET=18; elif [ $HOUR -ge 12 ]; then TARGET=12; elif [ $HOUR -ge 08 ]; then TARGET=08; elif [ $HOUR -ge 06 ]; then TARGET=06; else TARGET=00; fi
+            FINAL_DATE=$(date -u -d "4 hours ago" +%Y-%m-%d)
+            echo "init_time=${FINAL_DATE}T${TARGET}:00:00Z" >> $GITHUB_OUTPUT
+          fi
+          echo "Rodada selecionada: ${{ steps.set-time.outputs.init_time }}"
+
+      - name: Verificar quais modelos rodar
+        id: check-model
+        run: |
+          INPUT="${{ github.event.inputs.model_source }}"
+          if [ "$INPUT" == "ecmwf" ] || [ "$INPUT" == "both" ] || [ -z "$INPUT" ]; then
+            echo "run_ecmwf=true" >> $GITHUB_OUTPUT
+          else
+            echo "run_ecmwf=false" >> $GITHUB_OUTPUT
+          fi
+          
+          if [ "$INPUT" == "icon" ] || [ "$INPUT" == "both" ] || [ -z "$INPUT" ]; then
+            echo "run_icon=true" >> $GITHUB_OUTPUT
+          else
+            echo "run_icon=false" >> $GITHUB_OUTPUT
+          fi
+
+  process-ecmwf:
+    needs: detect-cycle
+    if: ${{ needs.detect-cycle.outputs.run_ecmwf == 'true' }}
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bullseye # Imagem base limpa, vamos instalar o necessário ou usar um entrypoint específico
+      options: --shm-size=4g
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup Environment (WRF Dependencies)
+        run: |
+          echo "[CIM-WRF3] Instalando dependências básicas..."
+          apt-get update && apt-get install -y \
+            gfortran gcc g++ make cmake \
+            libopenmpi-dev openmpi-bin \
+            libnetcdf-dev libnetcdff-dev \
+            libjasper-dev libpng-dev libz-dev \
+            python3 python3-pip python3-netcdf4 python3-xarray \
+            git wget curl time \
+            csh tcsh perl
+        
+          pip3 install requests numpy pandas xarray netCDF4 cfgrib eccodes
+        
+          # NOTA: Em um cenário real de produção, aqui entraria o download de um binário WRF pré-compilado
+          # ou a compilação rápida do WRF/WPS. Como não podemos baixar 20GB no runner a cada vez,
+          # a estratégia ideal é ter uma imagem Docker personalizada já com o WRF.
+          # Para este exemplo, vamos simular a estrutura de pastas e chamar o script lógico.
+          
+          mkdir -p /opt/wrf_data/{WPS,WRFV4}
+          echo "[CIM-WRF3] Ambiente base preparado."
+
+      - name: Download WRF Binaries (Simulado/Cache)
+        run: |
+          # ESTRATÉGIA REAL:
+          # 1. Ter um release no GitHub com o WRF compilado (.tar.gz)
+          # 2. Ou usar um volume cacheado persistente.
+          # Aqui, vamos assumir que o usuário fez upload do WRF compilado em um Release ou Artifact fixo.
+          echo "[CIM-WRF3] Verificando cache do WRF..."
+          # Se não tiver cache, o job falharia aqui sem um binário real.
+          # Para fins deste script, vamos criar um 'fake' wrf.exe para teste de fluxo
+          # EM PRODUÇÃO: Substituir por download real do seu pacote WRF compilado
+          echo "wget [URL_DO_SEU_WRF_COMPILADO.tar.gz] && tar -xzf ..." > /tmp/real_command.sh
+          echo "[CIM-WRF3] AVISO: Sem binário WRF real detectado no runner. Necessário configurar Release ou Imagem Docker."
+          # Criando executáveis dummy para validar o fluxo do script Python
+          mkdir -p /opt/wrf_data/WPS /opt/wrf_data/WRFV4/test/em_real
+          touch /opt/wrf_data/WPS/geogrid.exe /opt/wrf_data/WPS/ungrib.exe /opt/wrf_data/WPS/metgrid.exe
+          touch /opt/wrf_data/WRFV4/test/em_real/real.exe /opt/wrf_data/WRFV4/test/em_real/wrf.exe
+          chmod +x /opt/wrf_data/WPS/*.exe /opt/wrf_data/WRFV4/test/em_real/*.exe
+
+      - name: Prepare Domain Configuration (CIM 3km)
+        run: |
+          echo "[CIM-WRF3] Configurando domínio CIM (Cone Sul 3km)..."
+          cp config/cim/namelist.wps.cim /opt/wrf_data/WPS/namelist.wps
+          cp config/cim/namelist.input.cim /opt/wrf_data/WRFV4/test/em_real/namelist.input
+          
+          # Ajustar datas no namelist dinamicamente
+          INIT_TIME="${{ needs.detect-cycle.outputs.init_time }}"
+          echo "init_time = $INIT_TIME" >> $GITHUB_STEP_SUMMARY
+
+      - name: Download Input Data (ECMWF)
+        run: |
+          echo "[CIM-WRF3] Baixando dados ECMWF Open Data..."
+          python3 scripts/download_ecmwf.py \
+            --init-time "${{ needs.detect-cycle.outputs.init_time }}" \
+            --forecast-hours "${{ env.FORECAST_HOURS }}" \
+            --output-dir /opt/wrf_data/input_data \
+            --test-mode # Remover em produção real
+
+      - name: Execute WRF Chain (Geogrid -> Ungrib -> Metgrid -> Real -> WRF)
+        run: |
+          cd /opt/wrf_data
+          echo "[CIM-WRF3-WPS] Executando geogrid.exe..."
+          # ./WPS/geogrid.exe > log.geogrid 2>&1
+          
+          echo "[CIM-WRF3-WPS] Executando ungrib.exe..."
+          # ./WPS/ungrib.exe > log.ungrib 2>&1
+          
+          echo "[CIM-WRF3-WPS] Executando metgrid.exe..."
+          # ./WPS/metgrid.exe > log.metgrid 2>&1
+          
+          echo "[CIM-WRF3-REAL] Executando real.exe..."
+          # ./WRFV4/test/em_real/real.exe > log.real 2>&1
+          
+          echo "[CIM-WRF3-WRF] Executando wrf.exe..."
+          # ./WRFV4/test/em_real/wrf.exe > log.wrf 2>&1
+          
+          echo "[CIM-WRF3] Simulação concluída (Modo Demonstração)"
+          # Em produção, os comandos acima estariam descomentados
+          mkdir -p /opt/wrf_data/WRFV4/test/em_real/output
+          touch /opt/wrf_data/WRFV4/test/em_real/output/wrfout_d01_2026-08-13_00:00:00
+
+      - name: Post-Processing
+        run: |
+          echo "[CIM-WRF3-POST] Convertendo wrfout para frames JSON..."
+          python3 scripts/postprocess_cim.py \
+            --input /opt/wrf_data/WRFV4/test/em_real/output \
+            --output /tmp/cim_frames \
+            --domain cim \
+            --model ecmwf \
+            --init-time "${{ needs.detect-cycle.outputs.init_time }}" \
+            --hours "${{ env.FORECAST_HOURS }}"
+
+      - name: Validate Output
+        run: |
+          echo "[CIM-WRF3-VALIDATE] Validando integridade dos dados..."
+          python3 scripts/validate_cim_wrf3.py \
+            --frames-dir /tmp/cim_frames \
+            --domain cim \
+            --model ecmwf \
+            --init-time "${{ needs.detect-cycle.outputs.init_time }}" \
+            --hours "${{ env.FORECAST_HOURS }}"
+
+      - name: Publish to Data Branch
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: /tmp/cim_frames
+          destination_dir: .
+          publish_branch: cim-wrf3-ecmwf-data
+          keep_files: false
+          commit_message: "Update CIM WRF 3KM (ECMWF) - ${{ needs.detect-cycle.outputs.init_time }}"
+
+  process-icon:
+    needs: detect-cycle
+    if: ${{ needs.detect-cycle.outputs.run_icon == 'true' }}
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bullseye
+      options: --shm-size=4g
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+      
+      - name: Setup Environment
+        run: |
+          apt-get update && apt-get install -y python3 python3-pip git wget curl
+          pip3 install requests numpy pandas xarray netCDF4 cfgrib eccodes
+          mkdir -p /opt/wrf_data/{WPS,WRFV4/test/em_real,input_data,output}
+          # Dummy executables
+          touch /opt/wrf_data/WPS/{geogrid,ungrib,metgrid}.exe
+          touch /opt/wrf_data/WRFV4/test/em_real/{real,wrf}.exe
+          chmod +x /opt/wrf_data/WPS/*.exe /opt/wrf_data/WRFV4/test/em_real/*.exe
+
+      - name: Configure Domain
+        run: |
+          cp config/cim/namelist.wps.cim /opt/wrf_data/WPS/namelist.wps
+          cp config/cim/namelist.input.cim /opt/wrf_data/WRFV4/test/em_real/namelist.input
+
+      - name: Download Input Data (ICON)
+        run: |
+          echo "[CIM-WRF3] Baixando dados ICON (DWD)..."
+          python3 scripts/download_icon.py \
+            --init-time "${{ needs.detect-cycle.outputs.init_time }}" \
+            --forecast-hours "${{ env.FORECAST_HOURS }}" \
+            --output-dir /opt/wrf_data/input_data \
+            --test-mode
+
+      - name: Execute WRF Chain
+        run: |
+          echo "[CIM-WRF3] Executando cadeia WRF para ICON..."
+          # Mesma lógica do ECMWF
+          mkdir -p /opt/wrf_data/WRFV4/test/em_real/output
+          touch /opt/wrf_data/WRFV4/test/em_real/output/wrfout_d01_2026-08-13_00:00:00
+
+      - name: Post-Processing
+        run: |
+          python3 scripts/postprocess_cim.py \
+            --input /opt/wrf_data/WRFV4/test/em_real/output \
+            --output /tmp/cim_frames_icon \
+            --domain cim \
+            --model icon \
+            --init-time "${{ needs.detect-cycle.outputs.init_time }}" \
+            --hours "${{ env.FORECAST_HOURS }}"
+
+      - name: Validate Output
+        run: |
+          python3 scripts/validate_cim_wrf3.py \
+            --frames-dir /tmp/cim_frames_icon \
+            --domain cim \
+            --model icon \
+            --init-time "${{ needs.detect-cycle.outputs.init_time }}" \
+            --hours "${{ env.FORECAST_HOURS }}"
+
+      - name: Publish to Data Branch
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: /tmp/cim_frames_icon
+          destination_dir: .
+          publish_branch: cim-wrf3-icon-data
+          keep_files: false
+          commit_message: "Update CIM WRF 3KM (ICON) - ${{ needs.detect-cycle.outputs.init_time }}"
