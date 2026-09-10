@@ -1,0 +1,118 @@
+# CIM WRF 3 KM - Container Docker com WRF 4.4.0 + WPS 4.4.0
+# Base: Ubuntu 22.04 com todas as dependências compiladas
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV WRF_VERSION=4.4.0
+ENV WPS_VERSION=4.4.0
+ENV WRF_DIR=/opt/WRFV4
+ENV WPS_DIR=/opt/WPS
+ENV GEOG_DATA_DIR=/opt/geog_data
+
+# Instalar dependências do sistema
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gfortran \
+    gcc \
+    cpp \
+    make \
+    csh \
+    tcsh \
+    perl \
+    libperl-dev \
+    python3 \
+    python3-pip \
+    python3-netcdf4 \
+    python3-numpy \
+    python3-xarray \
+    python3-dask \
+    libnetcdf-dev \
+    libnetcdff-dev \
+    libhdf5-dev \
+    libhdf5-hl-dev \
+    libjasper-dev \
+    libpng-dev \
+    libjpeg-dev \
+    zlib1g-dev \
+    libzstd-dev \
+    libbz2-dev \
+    libaec-dev \
+    openmpi-bin \
+    libopenmpi-dev \
+    git \
+    wget \
+    curl \
+    time \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configurar variáveis de ambiente MPI e compiladores
+ENV CC=mpicc
+ENV FC=mpif90
+ENV F77=mpif77
+ENV CXX=mpicxx
+ENV JASPERLIB=/usr/lib/x86_64-linux-gnu
+ENV JASPERINC=/usr/include/jasper
+
+# Baixar e compilar WRF
+WORKDIR /opt
+RUN wget -q https://github.com/wrf-model/WRF/archive/refs/tags/v${WRF_VERSION}.tar.gz -O wrf.tar.gz && \
+    tar -xzf wrf.tar.gz && \
+    mv WRF-${WRF_VERSION} WRFV4 && \
+    rm wrf.tar.gz
+
+WORKDIR ${WRF_DIR}
+
+# Configurar compile para Linux x86_64, gfortran, OpenMPI
+# Opção 34: dmpar (distributed memory parallel)
+RUN echo -e "34\n1\n1\n1\n" | ./configure
+
+# Compilar WRF (apenas em_real e wrf.exe)
+RUN ./compile em_real >& compile_wrf.log || (tail -100 compile_wrf.log && exit 1)
+
+# Verificar se a compilação foi bem sucedida
+RUN test -f main/wrf.exe && test -f main/real.exe || (echo "WRF compilation failed" && exit 1)
+
+# Baixar e compilar WPS
+WORKDIR /opt
+RUN wget -q https://github.com/wrf-model/WPS/archive/refs/tags/v${WPS_VERSION}.tar.gz -O wps.tar.gz && \
+    tar -xzf wps.tar.gz && \
+    mv WPS-${WPS_VERSION} WPS && \
+    rm wps.tar.gz
+
+WORKDIR ${WPS_DIR}
+
+# Linkar com WRF compilado
+ENV WRF_DIR=${WRF_DIR}
+
+# Configurar compile WPS
+# Opção 3: gfortran, OpenMPI, Linux x86_64
+RUN echo -e "3\n" | ./configure
+
+# Compilar WPS
+RUN ./compile >& compile_wps.log || (tail -100 compile_wps.log && exit 1)
+
+# Verificar se a compilação foi bem sucedida
+RUN test -f geogrid.exe && test -f metgrid.exe && test -f ungrib.exe || (echo "WPS compilation failed" && exit 1)
+
+# Baixar dados geográficos estáticos básicos para o domínio CIM
+# Dados de baixa resolução para teste rápido (pode ser substituído por alta resolução)
+WORKDIR /opt
+RUN mkdir -p ${GEOG_DATA_DIR} && \
+    wget -q http://www2.mmm.ucar.edu/wrf/src/wrfpkg/data/geog_low_res_mandatory.tar.gz -O geog.tar.gz && \
+    tar -xzf geog.tar.gz -C ${GEOG_DATA_DIR} && \
+    rm geog.tar.gz
+
+# Instalar scripts Python adicionais necessários
+RUN pip3 install --upgrade pip && \
+    pip3 install requests cfgrib eccodes cdsapi gzip
+
+# Criar diretório de trabalho
+WORKDIR /wrf_run
+
+# Variáveis de ambiente para execução
+ENV PATH=${WRF_DIR}/main:${WPS_DIR}:${PATH}
+ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+
+# Script de entrada padrão
+ENTRYPOINT ["/bin/bash"]

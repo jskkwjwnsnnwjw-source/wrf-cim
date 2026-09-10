@@ -1,41 +1,48 @@
 {
   "domain": "cim",
   "name": "CIM WRF 3 KM",
-  "description": "Domínio Cone Sul - Sul do Brasil, Paraguai, Uruguai, Argentina",
-  "resolutionKm": 3,
-  "dx": 3000,
-  "dy": 3000,
-  "projection": "lambert",
-  "geogrid": {
-    "e_we": 1801,
-    "e_sn": 1401,
-    "ref_lat": -29.5,
-    "ref_lon": -56.0,
-    "truelat1": -25.0,
-    "truelat2": -33.0,
-    "stand_lon": -56.0,
-    "map_proj": "lambert"
-  },
+  "description": "Modelo regional de alta resolução para o Cone Sul",
+  "resolution_km": 3,
+  "projection": "lambert_conformal",
   "bounds": {
     "south": -40.0,
     "north": -19.0,
     "west": -65.0,
     "east": -47.0
   },
+  "grid": {
+    "e_we": 1801,
+    "e_sn": 1401,
+    "dx_meters": 3000,
+    "dy_meters": 3000,
+    "total_cells": 2523201
+  },
+  "reference_point": {
+    "ref_lat": -29.5,
+    "ref_lon": -56.0,
+    "truelat1": -25.0,
+    "truelat2": -33.0,
+    "stand_lon": -56.0
+  },
+  "coverage": [
+    "Paraná",
+    "Santa Catarina",
+    "Rio Grande do Sul",
+    "Paraguai",
+    "Uruguai",
+    "Nordeste da Argentina",
+    "Parte da Argentina Central"
+  ],
+  "vertical_levels": 50,
   "physics": {
-    "mp_physics": 8,
-    "ra_lw_physics": 1,
-    "ra_sw_physics": 2,
-    "sf_sfclay_physics": 1,
-    "sf_surface_physics": 2,
-    "bl_pbl_physics": 1,
-    "cu_physics": 0,
-    "non_hydrostatic": true
+    "microphysics": "Morrison double-moment (mp_physics=8)",
+    "longwave_radiation": "RRTM (ra_lw_physics=1)",
+    "shortwave_radiation": "Dudhia (ra_sw_physics=2)",
+    "pbl": "YSU (bl_pbl_physics=1)",
+    "surface_layer": "Monin-Obukhov (sf_sfclay_physics=1)",
+    "cumulus": "Desativado - Convecção Explícita (cu_physics=0)"
   },
-  "forecast": {
-    "hours": [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36],
-    "history_interval": 180,
-    "time_step": 18
-  },
-  "models": ["ecmwf_cim_wrf3", "icon_cim_wrf3"]
+  "time_step_seconds": 18,
+  "forecast_hours": 36,
+  "output_interval_hours": 3
 }

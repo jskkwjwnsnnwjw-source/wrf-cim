@@ -1,125 +1,123 @@
 #!/usr/bin/env python3
 """
-Download de dados ECMWF usando Open Data público (SEM API KEY).
-
-Fontes: https://data.ecmwf.int/forecasts/
-
-Formato URL:
-https://data.ecmwf.int/forecasts/YYYYMMDD/HHZ/ifs/0p25/oper/YYYYMMDDHH0000-HHh-oper-fc.grib2
-
-Exemplo real:
-https://data.ecmwf.int/forecasts/20260910/00z/ifs/0p25/oper/20260910000000-0h-oper-fc.grib2
+Download de dados ECMWF Open Data para CIM WRF 3 KM
+Fonte: https://data.ecmwf.int/forecasts/
+Não requer API key (dados abertos)
 
 Uso:
-    python3 download_ecmwf.py -i "2026-09-10T00:00:00Z" -f "0,3,6" -o ./ecmwf_data -t
+    python3 download_ecmwf.py -i "2024-01-15T12:00:00Z" -f "0,3,6,9,12" -o ./ecmwf_data
 """
 
 import argparse
 import os
-import re
 import sys
-from datetime import datetime, timedelta
-from pathlib import Path
 import requests
-from typing import List
+from datetime import datetime, timedelta
 
-def build_ecmwf_url(init_time: datetime, forecast_hour: int) -> str:
-    """Constrói URL para arquivo GRIB2 completo do ECMWF."""
-    base = "https://data.ecmwf.int/forecasts"
+def parse_args():
+    parser = argparse.ArgumentParser(description='Download ECMWF Open Data')
+    parser.add_argument('-i', '--init-time', required=True, help='Initial time (ISO format: YYYY-MM-DDTHH:MM:SSZ)')
+    parser.add_argument('-f', '--forecast-hours', required=True, help='Forecast hours comma-separated (e.g., 0,3,6,9,12)')
+    parser.add_argument('-o', '--output-dir', default='./ecmwf_data', help='Output directory')
+    parser.add_argument('-t', '--test-mode', action='store_true', help='Test mode: only check availability, do not download')
+    return parser.parse_args()
+
+def get_ecmwf_url(init_time_str, forecast_hour):
+    """Gerar URL para arquivo ECMWF Open Data"""
+    init_time = datetime.fromisoformat(init_time_str.replace('Z', '+00:00'))
     date_str = init_time.strftime('%Y%m%d')
     hour_str = init_time.strftime('%H')
-    timestamp = init_time.strftime('%Y%m%d%H%M%S')
-    return f"{base}/{date_str}/{hour_str}z/ifs/0p25/oper/{timestamp}-{forecast_hour}h-oper-fc.grib2"
-
-def list_available_files(init_time: datetime) -> List[str]:
-    """Lista arquivos .grib2 disponíveis."""
-    base = "https://data.ecmwf.int/forecasts"
-    date_str = init_time.strftime('%Y%m%d')
-    hour_str = init_time.strftime('%H')
-    url = f"{base}/{date_str}/{hour_str}z/ifs/0p25/oper/"
+    forecast_hour_str = f"{forecast_hour:03d}"
     
-    try:
-        resp = requests.get(url, timeout=30)
-        if resp.status_code != 200:
-            return []
-        return re.findall(r'href="([^"]*\.grib2)"', resp.text)
-    except Exception as e:
-        print(f"[ECMWF] Erro listando: {e}")
-        return []
+    base_url = "https://data.ecmwf.int/forecasts"
+    filename = f"{date_str}{hour_str}0000-{forecast_hour_str}h-oper-fc.grib2"
+    
+    url = f"{base_url}/{date_str}/{hour_str}z/ifs/0p25/oper/{filename}"
+    return url
 
-def download_file(url: str, output: Path, test_mode: bool = False) -> bool:
-    """Baixa arquivo GRIB2."""
+def check_availability(url):
+    """Verificar se o arquivo está disponível (HEAD request)"""
     try:
-        head = requests.head(url, timeout=30, allow_redirects=True)
-        
-        if head.status_code == 404:
-            print(f"[ECMWF] ✗ Não encontrado: {os.path.basename(url)}")
-            return False
-        
-        if test_mode:
-            size = head.headers.get('content-length', '?')
-            mb = float(size)/1e6 if size != '?' else 0
-            print(f"[ECMWF] ✓ Disponível: {os.path.basename(url)} ({mb:.1f} MB)")
-            return True
-        
-        print(f"[ECMWF] ↓ {os.path.basename(url)}")
-        resp = requests.get(url, timeout=600, stream=True)
-        resp.raise_for_status()
-        
-        total = int(resp.headers.get('content-length', 0))
-        done = 0
-        with open(output, 'wb') as f:
-            for chunk in resp.iter_content(8192):
-                if chunk:
-                    f.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        print(f"\r[ECMWF]   {done/total*100:.1f}%", end='')
-        
-        print(f"\n[ECMWF] ✓ {output.name} ({done/1e6:.1f} MB)")
-        return True
-    except Exception as e:
-        print(f"\n[ECMWF] ✗ Erro: {e}")
+        response = requests.head(url, timeout=30)
+        return response.status_code == 200
+    except requests.RequestException:
         return False
 
-def main():
-    p = argparse.ArgumentParser(description='Download ECMWF Open Data')
-    p.add_argument('-i', '--init-time', required=True)
-    p.add_argument('-f', '--hours', default='0,3,6,9,12,15,18,21,24,27,30,33,36')
-    p.add_argument('-o', '--output-dir', default='./ecmwf_data')
-    p.add_argument('-t', '--test-mode', action='store_true')
-    args = p.parse_args()
+def download_file(url, output_path):
+    """Baixar arquivo com progress bar"""
+    print(f"[ECMWF] Downloading: {url}")
     
-    try:
-        init = datetime.fromisoformat(args.init_time.replace('Z', '+00:00'))
-    except ValueError as e:
-        print(f"[ECMWF] ✗ Erro: {e}")
+    response = requests.get(url, stream=True, timeout=300)
+    response.raise_for_status()
+    
+    total_size = int(response.headers.get('content-length', 0))
+    downloaded = 0
+    
+    with open(output_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total_size > 0:
+                    percent = (downloaded / total_size) * 100
+                    print(f"\r[ECMWF] Progress: {percent:.1f}% ({downloaded/1024/1024:.1f} MB)", end='', flush=True)
+    
+    print()
+    return True
+
+def main():
+    args = parse_args()
+    forecast_hours = [int(h.strip()) for h in args.forecast_hours.split(',')]
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    print(f"[ECMWF] Initial time: {args.init_time}")
+    print(f"[ECMWF] Forecast hours: {forecast_hours}")
+    print(f"[ECMWF] Output directory: {args.output_dir}")
+    print()
+    
+    print("[ECMWF] Checking availability...")
+    available_files = []
+    
+    for hour in forecast_hours:
+        url = get_ecmwf_url(args.init_time, hour)
+        if check_availability(url):
+            available_files.append((hour, url))
+            print(f"[ECMWF] OK F{hour:03d}")
+        else:
+            print(f"[ECMWF] FAIL F{hour:03d}")
+    
+    if not available_files:
+        print("[ECMWF] ERRO: Nenhum arquivo disponivel.")
         sys.exit(1)
     
-    hstr = args.hours
-    hours = list(range(int(hstr.split('-')[0]), int(hstr.split('-')[1])+1, 3)) if '-' in hstr and ',' not in hstr else [int(x.strip()) for x in hstr.split(',')]
+    if args.test_mode:
+        print("\n[ECMWF] TEST MODE: Skipping download.")
+        print("[ECMWF] SUCESSO")
+        sys.exit(0)
     
-    outdir = Path(args.output_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    print("\n[ECMWF] Starting download...")
+    downloaded_count = 0
     
-    print(f"\n{'='*60}\n[ECMWF] Init: {init.strftime('%Y-%m-%d %H:%M UTC')}\n[ECMWF] Hours: {hours}\n[ECMWF] Test: {args.test_mode}\n{'='*60}\n")
+    for hour, url in available_files:
+        filename = os.path.basename(url)
+        output_path = os.path.join(args.output_dir, filename)
+        
+        try:
+            download_file(url, output_path)
+            downloaded_count += 1
+            print(f"[ECMWF] OK: {filename}")
+        except Exception as e:
+            print(f"[ECMWF] FAIL {filename}: {e}")
     
-    # Listar disponíveis
-    print("[ECMWF] Verificando disponibilidade...")
-    avail = list_available_files(init)
-    if avail:
-        print(f"[ECMWF] {len(avail)} arquivos encontrados")
-    
-    # Download
-    ok = True
-    for h in hours:
-        url = build_ecmwf_url(init, h)
-        fname = f"ECMF_{init.strftime('%Y%m%d_%H')}_{h:03d}h_oper.grib2"
-        if not download_file(url, outdir/fname, args.test_mode):
-            ok = False
-    
-    print(f"\n{'='*60}\n[ECMWF] {'✓ SUCESSO' if ok or args.test_mode else '✗ FALHA'}\n{'='*60}\n")
-    sys.exit(0 if ok or args.test_mode else 1)
+    print()
+    print("=" * 50)
+    print(f"[ECMWF] Completed: {downloaded_count}/{len(available_files)} files")
+    if downloaded_count == len(available_files):
+        print("[ECMWF] SUCESSO")
+        sys.exit(0)
+    else:
+        print("[ECMWF] AVISO: Alguns downloads falharam")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
